@@ -79,7 +79,9 @@ MissionBlock::MissionBlock(Navigator *navigator, const char *name) :
 	_param_yaw_timeout(this, "MIS_YAW_TMT", false),
 	_param_yaw_err(this, "MIS_YAW_ERR", false),
 	_param_vtol_wv_land(this, "VT_WV_LND_EN", false),
-	_param_vtol_wv_loiter(this, "VT_WV_LTR_EN", false)
+	_param_vtol_wv_takeoff(this, "VT_WV_TKO_EN", false),
+	_param_vtol_wv_loiter(this, "VT_WV_LTR_EN", false),
+	_param_force_vtol(this, "NAV_FORCE_VT", false)
 {
 }
 
@@ -124,19 +126,6 @@ MissionBlock::is_mission_item_reached()
 			}
 
 		case NAV_CMD_DO_CHANGE_SPEED:
-			// XXX not differentiating ground and airspeed yet
-			if (_mission_item.params[1] > 0.0f) {
-				_navigator->set_cruising_speed(_mission_item.params[1]);
-			} else {
-				_navigator->set_cruising_speed();
-				/* if no speed target was given try to set throttle */
-				if (_mission_item.params[2] > 0.0f) {
-					_navigator->set_cruising_throttle(_mission_item.params[2] / 100);
-				} else {
-					_navigator->set_cruising_throttle();
-				}
-			}
-
 			return true;
 
 		default:
@@ -165,7 +154,7 @@ MissionBlock::is_mission_item_reached()
 
 		if ((_mission_item.nav_cmd == NAV_CMD_TAKEOFF || _mission_item.nav_cmd == NAV_CMD_VTOL_TAKEOFF)
 			&& _navigator->get_vstatus()->is_rotary_wing) {
-			/* require only altitude for takeoff for multicopter */
+			/* require only altitude for takeoff for multicopter, do not use waypoint acceptance radius */
 			if (_navigator->get_global_position()->alt >
 					altitude_amsl - _navigator->get_altitude_acceptance_radius()) {
 				_waypoint_position_reached = true;
@@ -416,22 +405,6 @@ MissionBlock::item_contains_position(const struct mission_item_s *item)
 void
 MissionBlock::mission_item_to_position_setpoint(const struct mission_item_s *item, struct position_setpoint_s *sp)
 {
-	/* set the correct setpoint for vtol transition */
-
-	if (item->nav_cmd == NAV_CMD_DO_VTOL_TRANSITION && PX4_ISFINITE(item->yaw)
-			&& item->params[0] >= vtol_vehicle_status_s::VEHICLE_VTOL_STATE_FW - 0.5f) {
-
-		sp->type = position_setpoint_s::SETPOINT_TYPE_POSITION;
-		waypoint_from_heading_and_distance(_navigator->get_global_position()->lat,
-										   _navigator->get_global_position()->lon,
-										   item->yaw,
-										   1000000.0f,
-										   &sp->lat,
-										   &sp->lon);
-		sp->alt = _navigator->get_global_position()->alt;
-	}
-
-
 	/* don't change the setpoint for non-position items */
 	if (!item_contains_position(item)) {
 		return;
@@ -458,6 +431,9 @@ MissionBlock::mission_item_to_position_setpoint(const struct mission_item_s *ite
 	case NAV_CMD_TAKEOFF:
 	case NAV_CMD_VTOL_TAKEOFF:
 		sp->type = position_setpoint_s::SETPOINT_TYPE_TAKEOFF;
+		if(_navigator->get_vstatus()->is_vtol && _param_vtol_wv_takeoff.get()){
+			sp->disable_mc_yaw_control = true;
+		}
 		break;
 
 	case NAV_CMD_LAND:
@@ -609,7 +585,8 @@ MissionBlock::set_land_item(struct mission_item_s *item, bool at_current_locatio
 {
 
 	/* VTOL transition to RW before landing */
-	if (_navigator->get_vstatus()->is_vtol && !_navigator->get_vstatus()->is_rotary_wing) {
+	if (_navigator->get_vstatus()->is_vtol && !_navigator->get_vstatus()->is_rotary_wing &&
+			_param_force_vtol.get() == 1) {
 		struct vehicle_command_s cmd = {};
 		cmd.command = NAV_CMD_DO_VTOL_TRANSITION;
 		cmd.param1 = vtol_vehicle_status_s::VEHICLE_VTOL_STATE_MC;
